@@ -26,7 +26,7 @@ python train_roberta_iecv.py
 python train_flant5_iecv.py
 ```
 
-### 3. Fine-tune FLAN-T5 with LoRA
+### 4. Fine-tune FLAN-T5 with LoRA
 ```
 python train_flant5_lora.py
 ```
