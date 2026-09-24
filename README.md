@@ -1,6 +1,6 @@
 # Fine-Tuned Large Language Models for Detecting Social Isolation from Unstructured Clinical Notes
 
-This repository contains the code used in the paper “Fine-Tuned Large Language Models for Detecting Social Isolation from Unstructured Clinical Notes”, which investigates transformer-based approaches for social isolation detection.
+This repository contains the code used in the paper “Distinguishing Social Isolation, Social Support, and Contextual False Positives in Clinical Notes Using Fine-Tuned Language Models: Multisite Validation Study”, which investigates transformer-based approaches for social isolation detection.
 
 ## Overview
 
