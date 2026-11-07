@@ -33,7 +33,7 @@ python train_flant5_lora.py
 
 ### 5. Fine-tune Gemma-2-2B with QLoRA
 ```
-python train_gemma2_qlora.py
+python train_gemma2_qlora_iecv.py
 ```
 
 Annotated clinical data and pretrained model weights are not distributed through this repository due to privacy and licensing constraints.
