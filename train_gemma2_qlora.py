@@ -83,7 +83,6 @@ def clean_text(text):
     """Clean narrative text: remove symbols, bullets, URLs, punctuation, etc."""
     if not isinstance(text, str):
         return ""
-#     text = re.sub(r"[✔✓•■□▪▫●○★☆☑☐❍❏❑⦿⦾•�]", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     text = re.sub(r"\n", " ", text).strip()
     text = text.upper()
