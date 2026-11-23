@@ -7,7 +7,7 @@ This repository contains the code used in the paper “Distinguishing Social Iso
 The script performs:
 - Text preprocessing and cleaning of clinical narratives
 - Internal-External Cross-Validation (IECV) across three healthcare sites
-- Fine-tuning of BERT, RoBERTa, and FLAN-T5 for multi-class classification
+- Fine-tuning of BERT, RoBERTa, FLAN-T5, and Gemma-2-2B for multi-class classification
 - LoRA-based parameter-efficient fine-tuning (PEFT) of FLAN-T5 and QLoRA-based parameter-efficient fine-tuning of Gemma-2-2B for multi-class classification
 - Evaluation using macro F1 score and detailed classification reports
 
@@ -26,14 +26,21 @@ python train_roberta_iecv.py
 python train_flant5_iecv.py
 ```
 
-### 4. Fine-tune FLAN-T5 with LoRA
+### 4. Fine-tune Gemma-2-2B
+```
+python train_gemma2_iecv.py
+```
+
+### 5. Fine-tune FLAN-T5 with LoRA
 ```
 python train_flant5_lora.py
 ```
 
-### 5. Fine-tune Gemma-2-2B with QLoRA
+### 6. Fine-tune Gemma-2-2B with QLoRA
 ```
-python train_gemma2_qlora_iecv.py
+python train_gemma2_qlora.py
 ```
+
+
 
 Annotated clinical data and pretrained model weights are not distributed through this repository due to privacy and licensing constraints.
