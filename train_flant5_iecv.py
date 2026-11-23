@@ -4,7 +4,12 @@ FLAN-T5 IECV for Social Isolation Detection - Cross-Site Validation
 
 This script performs Internal-External cross-validation (IECV) for social isolation detection
 using FLAN-T5-large across multiple healthcare sites.
+
+Author: Lokesh Chinthala
+Date: 09/05/2025
+License: MIT License
 """
+# Load the libraries
 import torch
 import torch.nn.functional as F
 from transformers import T5Tokenizer, T5ForConditionalGeneration, Trainer, TrainingArguments
@@ -15,15 +20,18 @@ import json
 import pandas as pd
 import numpy as np
 import random
+import gc
 from random import choices
 
 from datasets import Dataset
 from collections import Counter
 from sklearn.metrics import f1_score, classification_report
+from sklearn.model_selection import train_test_split
 
 
 # Function to set random seed for reproducibility
 def set_seed(seed):
+    """Set seed for reproducibility across libraries (random, numpy, torch)."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -32,23 +40,34 @@ def set_seed(seed):
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
-
 # Set random seed
 seed_value = 43
 set_seed(seed_value)
 
 # Clear GPU Memory
-torch.cuda.empty_cache()
+def clear_gpu_memory():
+    gc.collect()
+    
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
+# Define valid labels
+valid_labels = ['social isolation', 'no social isolation', 'social support']
+
+
+# Text cleaning
 def clean_text(text):
-    """Clean narrative text."""
+    """Clean narrative text: remove symbols, bullets, URLs, punctuation, etc."""
     if not isinstance(text, str):
         return ""
+    
     text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\n", " ", text).strip()
     text = text.upper()
     return text
 
-
+# Load json files
 def load_json_file(file_path):
     with open(file_path, "r") as file:
         data = json.load(file)
@@ -56,6 +75,7 @@ def load_json_file(file_path):
             raise ValueError(f"Unexpected JSON format in {file_path}")
         return data
 
+# Prepare data
 def prepare_data(file_path, valid_labels):
     data = load_json_file(file_path)
     labelled, unlabelled = [], []
@@ -83,17 +103,13 @@ def prepare_data(file_path, valid_labels):
     return labelled, unlabelled
 
 
-# Define valid labels
-valid_labels = ['social isolation', 'no social isolation', 'social support']
-
-# Define sites
 sites = {
-        "site1_data": "/data/site1_annotated_data.json",
-        "site2_data": "/data/site2_annotated_data.json",
-        "site3_data": "/data/site3_annotated_data.json",
-    }
+    "site1_data": "/Data/site1_social_isolation_complete_annotated_data_fulltext.json",
+    "site2_data": "/Data/site2_social_isolation_complete_annotated_data_fulltext.json",
+    "site3_data": "/Data/site3_social_isolation_complete_annotated_data_fulltext.json",
+}
 
-# Load all site data
+
 site_data = {}
 for site, path in sites.items():
     labelled, _ = prepare_data(path, valid_labels)
@@ -107,9 +123,9 @@ def tokenize_batch(examples, tokenizer):
     for sentence in examples['sentence']:
         input_text = (
             f"Classify the text into exactly one category: 'social isolation', "
-            f"'no social isolation' or 'social support'.\n"
+            f"'no social isolation', or 'social support'.\n"
             f"Text: {sentence}\n"
-            f"Category:"
+            f"Category: "
         )
         inputs.append(input_text)
     
@@ -117,7 +133,7 @@ def tokenize_batch(examples, tokenizer):
         inputs,
         padding="max_length",
         truncation=True,
-        max_length=128
+        max_length=256
     )
     
     with tokenizer.as_target_tokenizer():
@@ -147,9 +163,9 @@ def predict_batch(texts, model, tokenizer, batch_size=8):
         for text in batch_texts:
             input_text = (
                 f"Classify the text into exactly one category: 'social isolation', "
-                f"'no social isolation' or 'social support'.\n"
+                f"'no social isolation', or 'social support'.\n"
                 f"Text: {text}\n"
-                f"Category:"
+                f"Category: "
             )
             input_texts.append(input_text)
         
@@ -158,7 +174,7 @@ def predict_batch(texts, model, tokenizer, batch_size=8):
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=128
+            max_length=256
         )
         inputs = {key: val.to(device) for key, val in inputs.items()}
         
@@ -176,39 +192,41 @@ def predict_batch(texts, model, tokenizer, batch_size=8):
     return predicted_labels
 
 
+# IECV helper function
 def train_eval(train_sites, test_site):
     print(f"\nTraining on {train_sites}, Testing on {test_site}")
+    
+    # Build train and test sets
+    train_pool = sum([site_data[s] for s in train_sites], [])
+    holdout_data = site_data[test_site]
 
-    # Combine training data
-    train_data = sum([site_data[s] for s in train_sites], [])
-    test_data = site_data[test_site]
+    # Drop duplicates
+    df_train = pd.DataFrame(train_pool).drop_duplicates(subset=["sentence", "label"])
+    df_holdout = pd.DataFrame(holdout_data).drop_duplicates(subset=["sentence", "label"])
 
-    ## Train
-    df_train = pd.DataFrame(train_data).drop_duplicates(subset=["file_name", "sentence", "label"])
-
-    no_si_train = df_train[df_train['label'] == 'no social isolation']
-    no_si_train = no_si_train.drop_duplicates(subset=["sentence", "label"])
-
-    others_train = df_train[df_train['label'] != 'no social isolation']
-    df_train_balanced = pd.concat([no_si_train, others_train], ignore_index=True)
-
-    # Convert to Hugging Face Dataset
-    train_data_balanced = Dataset.from_pandas(df_train_balanced, preserve_index=False)
-
-    # Oversample to balance classes
-    counts = Counter([x["label"] for x in train_data_balanced])
-    max_count = max(counts.values())
-    oversampled = []
-    for label in counts:
-        samples = [ex for ex in train_data_balanced if ex["label"] == label]
-        oversampled.extend(choices(samples, k=max_count))
-
-    print("Balanced training size:", len(oversampled))
-    print("Class distribution:", Counter([x["label"] for x in oversampled]))
-
+    # Convert back to Hugging Face Dataset
+    formatted_labelled_data = Dataset.from_pandas(df_train, preserve_index=False)
+    
+    # Split clean train data into train and validation dataset for model evaluation during training
+    split_data = formatted_labelled_data.train_test_split(test_size=0.2, seed = seed_value)
+    
     # Convert to Hugging Face datasets
-    train_dataset = Dataset.from_list(oversampled)
-    test_dataset = Dataset.from_list(test_data)
+    train_ds = split_data['train']
+    val_dataset = split_data['test']
+        
+    # Oversample to balance classes   
+    counts = Counter([x["label"] for x in train_ds])
+    max_count = max(counts.values())
+    oversampled_train = []
+    for label in counts:
+        samples = [ex for ex in train_ds if ex["label"] == label]
+        oversampled_train.extend(choices(samples, k=max_count))
+
+    print("Balanced training size:", len(oversampled_train))
+    print("Class distribution:", Counter([x["label"] for x in oversampled_train]))
+    
+    # Convert train dataset to Hugging Face datasets
+    train_dataset = Dataset.from_list(oversampled_train)
 
     # Tokenization for FLAN-T5
     model_name = '/llm_model_files/models--google--flan-t5-large/snapshots/0613663d0d48ea86ba8cb3d7a44f0f65dc596a2a/'
@@ -223,11 +241,12 @@ def train_eval(train_sites, test_site):
         remove_columns=["sentence", "label", "file_name"]
     )
     
-    tokenized_test = test_dataset.map(
+    tokenized_test = val_dataset.map(
         tokenize_function,
         batched=True,
         remove_columns=["sentence", "label", "file_name"]
     )
+    
 
     # Model
     model = T5ForConditionalGeneration.from_pretrained(model_name)
@@ -260,37 +279,46 @@ def train_eval(train_sites, test_site):
     )
 
     trainer.train()
-    
-    # Get predictions
-    true_labels = [item["label"] for item in test_data]
-    test_sentences = [item["sentence"] for item in test_data]
+
+    true_labels = df_holdout["label"].tolist()
+    test_sentences = df_holdout["sentence"].tolist()
     predicted_labels = predict_batch(test_sentences, model, tokenizer)
     
     # Calculate metrics
     y_true = [valid_labels.index(label) for label in true_labels]
-    y_pred = [valid_labels.index(label) if label in valid_labels else 0 
-              for label in predicted_labels]
-    f1 = f1_score(y_true, y_pred, average="macro")
+    y_pred = [valid_labels.index(label) if label in valid_labels else 0 for label in predicted_labels]
+    macro_f1 = f1_score(y_true, y_pred, average="macro")
 
     print("\nClassification Report:\n")
     print(classification_report(y_true, y_pred, target_names=valid_labels))
-    print(f"Macro F1 for {test_site}: {f1:.4f}")
-    return f1
+    print(f"Macro F1 for {test_site}: {macro_f1:.4f}")
+    
+    clear_gpu_memory()
+    return macro_f1
 
 
-# Run IECV
-results = {}
-results["site2_data"] = train_eval(["site1_data", "site3_data"], "site2_data")
-results["site1_data"] = train_eval(["site2_data", "site3_data"], "site1_data")
-results["site3_data"] = train_eval(["site1_data", "site2_data"], "site3_data")
+def main():
+    # --- Execution ---
+    results = {}
+
+    for holdout in ["site3_data", "site2_data", "site1_data"]:
+        train_set = [s for s in sites.keys() if s != holdout]
+        results[holdout] = train_eval(train_set, holdout)
 
 
-# Aggregate results
-f1_scores = list(results.values())
-mean_f1 = np.mean(f1_scores)
-std_f1 = np.std(f1_scores)
+    # Aggregate results
+    f1_scores = list(results.values())
+    mean_f1 = np.mean(f1_scores)
+    std_f1 = np.std(f1_scores)
 
-print("FLAN-T5 IECV RESULTS SUMMARY")
-for site, score in results.items():
-    print(f"Holdout {site}: F1 = {score:.4f}")
-print(f"\nMean ± SD F1 = {mean_f1:.4f} ± {std_f1:.4f}")
+    print("\n==============================")
+    print("IECV RESULTS SUMMARY")
+    print("==============================")
+    for site, score in results.items():
+        print(f"Holdout {site}: F1 = {score:.4f}")
+    print(f"\nMean ± SD F1 = {mean_f1:.4f} ± {std_f1:.4f}")
+    print("==============================\n")
+
+
+if __name__ == "__main__":
+    main()
