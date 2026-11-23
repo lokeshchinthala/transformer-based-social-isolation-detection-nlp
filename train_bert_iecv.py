@@ -202,7 +202,8 @@ def train_eval(train_sites, test_site):
         load_best_model_at_end=True,
         logging_dir=f"bert_logs_{test_site}",
         seed=seed_value,
-        dataloader_num_workers=64,
+        dataloader_num_workers=4,
+        save_total_limit=2,
         fp16=torch.cuda.is_available(),
     )
 
