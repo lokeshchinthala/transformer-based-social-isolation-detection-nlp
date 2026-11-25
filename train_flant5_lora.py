@@ -3,34 +3,46 @@
 FLAN-T5 with LoRA for Social Isolation Detection
 
 This script fine-tunes FLAN-T5-large with LoRA using all labelled data from all sites.
+
+Author: Lokesh Chinthala
+Date: 03/10/2026
+License: MIT License
 """
+
+# Load libraries
+import torch
+import torch.nn.functional as F
+from torch.nn.functional import softmax
+from transformers import T5Tokenizer, T5ForConditionalGeneration, Trainer, TrainingArguments
+
+from peft import LoraConfig, get_peft_model, TaskType
+
 import os
 import re
+import string
 import json
-import random
-import numpy as np
 import pandas as pd
-from collections import Counter
+import numpy as np
+import glob
+import random
+import gc
+import csv
 from random import choices
 
-import torch
-from datasets import Dataset
-from transformers import (
-    T5Tokenizer,
-    T5ForConditionalGeneration,
-    Trainer,
-    TrainingArguments,
-)
-from peft import LoraConfig, get_peft_model, TaskType
-from sklearn.metrics import f1_score, classification_report
+from accelerate import Accelerator
+from datasets import Dataset, DatasetDict
+from collections import Counter
 
-def set_seed(seed: int = 43) -> None:
-    """
-    Set random seed for reproducibility across all libraries.
-    
-    Args:
-        seed: Random seed value
-    """
+import nltk
+
+# Classifiction
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import f1_score, accuracy_score, precision_recall_fscore_support, classification_report
+
+
+# Function to set random seed for reproducibility
+def set_seed(seed):
+    """Set seed for reproducibility across libraries (random, numpy, torch)."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -39,57 +51,43 @@ def set_seed(seed: int = 43) -> None:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
-def clean_text(text: str) -> str:
-    """
-    Clean narrative text.
+
+# Clear GPU Memory
+def clear_gpu_memory():
+    gc.collect()
     
-    Args:
-        text: Input text to clean
-    
-    Returns:
-        Cleaned text
-    """
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+
+# Helper functions
+def clean_text(text):
+    """Clean narrative text: remove symbols, bullets, URLs, punctuation, etc."""
     if not isinstance(text, str):
         return ""
     text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\n", " ", text).strip()
     text = text.upper()
     return text
 
-def load_json_file(file_path: str) -> list:
-    """
-    Load data from a JSON file.
-    
-    Args:
-        file_path: Path to JSON file
-        
-    Returns:
-        List of data entries
-    """
+
+def load_json_file(file_path):
     with open(file_path, "r") as file:
         data = json.load(file)
         if not isinstance(data, list):
             raise ValueError(f"Unexpected JSON format in {file_path}")
         return data
 
-def prepare_data(file_path: str, valid_labels: list) -> list:
-    """
-    Prepare labelled data from JSON file.
-    
-    Args:
-        file_path: Path to JSON data file
-        valid_labels: List of valid label categories
-        
-    Returns:
-        List of labelled data
-    """
+
+def prepare_data(file_path, valid_labels):
     data = load_json_file(file_path)
-    labelled = []
-    
+    labelled, unlabelled = [], []
     for entry in data:
         file_name = entry["file_name"]
         text = entry["text"]
         
-        # Skip documents with example content
+        # Skip documents that contain the below
         if "HERE ARE SOME EXAMPLES" in text.upper():
             continue
         if "�BOREDOM OR LONELINESS" in text.upper():
@@ -98,46 +96,36 @@ def prepare_data(file_path: str, valid_labels: list) -> list:
         span = entry["span"]
         label = entry["label"]
         span_text = clean_text(span)
+        
         if label in valid_labels:
             if not span_text.strip():
                 continue
-            labelled.append({
-                "file_name": file_name,
-                "sentence": span_text,
-                "label": label
-            })    
-    return labelled
-
-def tokenize_batch(examples: dict, tokenizer: T5Tokenizer) -> dict:
-    """
-    Tokenize a batch of examples for FLAN-T5.
-    
-    Args:
-        examples: Batch of examples with 'sentence' and 'label'
-        tokenizer: T5 tokenizer
+            labelled.append({"file_name":file_name, "sentence": span_text, "label": label})
         
-    Returns:
-        Tokenized batch with input_ids and labels
-    """
+        else:
+            unlabelled.append({"file_name":file_name, "sentence": clean_text(text)})
+    return labelled, unlabelled
+
+
+def tokenize_batch(examples, tokenizer):
+    """Tokenize batch for FLAN-T5"""
     inputs = []
     for sentence in examples['sentence']:
         input_text = (
             f"Classify the text into exactly one category: 'social isolation', "
-            f"'no social isolation' or 'social support'.\n"
+            f"'no social isolation', or 'social support'.\n"
             f"Text: {sentence}\n"
-            f"Category:"
+            f"Category: "
         )
         inputs.append(input_text)
     
-    # Tokenize inputs
     model_inputs = tokenizer(
         inputs,
         padding="max_length",
         truncation=True,
-        max_length=128
+        max_length=256
     )
     
-    # Tokenize labels
     with tokenizer.as_target_tokenizer():
         labels = tokenizer(
             examples['label'],
@@ -149,37 +137,25 @@ def tokenize_batch(examples: dict, tokenizer: T5Tokenizer) -> dict:
     model_inputs["labels"] = labels["input_ids"]
     return model_inputs
 
-def predict_batch(texts: list, model, tokenizer: T5Tokenizer, batch_size: int = 8) -> list:
-    """
-    Generate predictions for a batch of texts.
-    
-    Args:
-        texts: List of input texts
-        model: Fine-tuned FLAN-T5 model with LoRA
-        tokenizer: T5 tokenizer
-        batch_size: Batch size for prediction
-        
-    Returns:
-        List of predicted labels
-    """
+
+def predict_batch(texts, model, tokenizer, batch_size=8):
+    """Predict batch of texts"""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
     model.eval()
     
     predicted_labels = []
     
-    # Process in batches
     for i in range(0, len(texts), batch_size):
-        batch_texts = texts[i:i + batch_size]
+        batch_texts = texts[i:i+batch_size]
         
-        # Prepare inputs
         input_texts = []
         for text in batch_texts:
             input_text = (
                 f"Classify the text into exactly one category: 'social isolation', "
-                f"'no social isolation' or 'social support'.\n"
+                f"'no social isolation', or 'social support'.\n"
                 f"Text: {text}\n"
-                f"Category:"
+                f"Category: "
             )
             input_texts.append(input_text)
         
@@ -188,185 +164,118 @@ def predict_batch(texts: list, model, tokenizer: T5Tokenizer, batch_size: int = 
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=128
+            max_length=256
         )
         inputs = {key: val.to(device) for key, val in inputs.items()}
         
-        # Generate predictions
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
                 max_length=20,
                 num_beams=1,
-                do_sample=False,
-                early_stopping=True
+                do_sample=False
             )
         
-        # Decode predictions
         batch_preds = tokenizer.batch_decode(outputs, skip_special_tokens=True)
         predicted_labels.extend(batch_preds)
     
     return predicted_labels
 
 
-def main():
-    """
-    Main function to train FLAN-T5 with LoRA on all data.
-    """
-    # Set random seed for reproducibility
-    seed_value = 43
-    set_seed(seed_value)
+def train_eval(site_data, valid_labels, seed_value):
+
+    # Build train and test sets
+    df_all = pd.concat(
+        {site: pd.DataFrame(data) for site, data in site_data.items()}, 
+        names = ['site']
+    ).reset_index(level='site')
+     
+    # Drop duplicates
+    df_unique = df_all.drop_duplicates(subset=["sentence", "label"], keep = 'first').copy()
     
-    # Clear GPU memory
-    torch.cuda.empty_cache()
-    
-    # Define valid labels
-    valid_labels = ['social isolation', 'no social isolation', 'social support']
-    
-    # Define data paths
-    sites = {
-        "site1_data": "/data/site1_annotated_data.json",
-        "site2_data": "/data/site2_annotated_data.json",
-        "site3_data": "/data/site3_annotated_data.json",
-    }
-    
-    # Path to pre-trained FLAN-T5 model
-    model_name = "/llm_model_files/models--google--flan-t5-large/snapshots/0613663d0d48ea86ba8cb3d7a44f0f65dc596a2a/"
-    
-    # Load and prepare data from all sites
-    print("="*60)
-    print("LOADING AND CONCATENATING DATA FROM ALL SITES")
-    print("="*60)
-    
-    all_labelled_data = []
-    
-    for site_name, file_path in sites.items():
-        try:
-            labelled = prepare_data(file_path, valid_labels)
-            all_labelled_data.extend(labelled)
-            print(f"{site_name}: {len(labelled)} labelled samples")
-        except Exception as e:
-            print(f"Error loading {site_name}: {e}")
-    
-    print(f"\nTotal labelled samples from all sites: {len(all_labelled_data)}")
-    
-    # Convert to Hugging Face Dataset
-    formatted_data = Dataset.from_list(all_labelled_data)
-    
-    # Calculate statistics
-    file_count = len(set(item["file_name"] for item in all_labelled_data))
-    class_count = Counter([item["label"] for item in formatted_data])
-    total_samples = len(formatted_data)
-    
-    print(f"\nDataset Statistics:")
-    print(f"Unique files: {file_count}")
-    print(f"Total samples: {total_samples}")
-    print(f"Class distribution:")
-    for label, count in class_count.items():
-        print(f"{label}: {count}")
-    
-    # Split into training and validation (80/20)
-    print(f"\nSplitting data (80/20 train/test)")
-    split_data = formatted_data.train_test_split(
+    # Split on unique spans for training and holdout
+    finetune_df, holdout_df = train_test_split(
+        df_unique,
         test_size=0.2,
-        seed=seed_value
+        random_state=seed_value,
+        stratify=df_unique['label']
     )
     
-    train_data_raw = split_data['train']
-    test_data = split_data['test']
+    print(f"Finetune spans: {len(finetune_df)}, Holdout spans: {len(holdout_df)}")
     
-    print(f"Training samples: {len(train_data_raw)}")
-    print(f"Testing samples: {len(test_data)}")
+    # Split on unique spans for finetuning
+    train_df, test_df = train_test_split(
+        finetune_df,
+        test_size=0.2,
+        random_state=seed_value,
+        stratify=finetune_df['label']
+    )
     
-    # Handle class imbalance in training data
-    print(f"\nHandling class imbalance...")
-    df_train = train_data_raw.to_pandas()
+    print(f"Training spans: {len(train_df)}, Test spans: {len(test_df)}")
     
-    # Remove duplicates from 'no social isolation' class
-    no_si_train = df_train[df_train['label'] == 'no social isolation']
-    no_si_train = no_si_train.drop_duplicates(subset=["sentence", "label"])
-    
-    others_train = df_train[df_train['label'] != 'no social isolation']
-    df_balanced = pd.concat([no_si_train, others_train], ignore_index=True)
-    
-    # Convert back to Dataset
-    train_dataset = Dataset.from_pandas(df_balanced, preserve_index=False)
-    
-    # Calculate class distribution for oversampling
-    class_count_train = Counter([item["label"] for item in train_dataset])
-    max_count_train = max(class_count_train.values())
-    
-    print(f"\nAfter deduplication:")
-    for label, count in class_count_train.items():
-        print(f"  {label}: {count}")
-    
-    # Oversample minority classes
+    # Convert to Hugging Face datasets
+    train_data = Dataset.from_pandas(train_df, preserve_index=False)
+    test_data = Dataset.from_pandas(test_df, preserve_index=False)
+#     holdout_data = Dataset.from_pandas(holdout_df)
+
+
+    # Oversample to balance classes   
+    counts = Counter([x["label"] for x in train_data])
+    max_count = max(counts.values())
     oversampled_train = []
-    for label in class_count_train:
-        label_samples = [ex for ex in train_dataset if ex["label"] == label]
-        oversampled_label_samples = choices(label_samples, k=max_count_train)
-        oversampled_train.extend(oversampled_label_samples)
+    for label in counts:
+        samples = [ex for ex in train_data if ex["label"] == label]
+        oversampled_train.extend(choices(samples, k=max_count))
+
+    print("Balanced training size:", len(oversampled_train))
+    print("Class distribution:", Counter([x["label"] for x in oversampled_train]))
     
-    # Final training dataset
-    train_data_balanced = Dataset.from_list(oversampled_train)
+    # Convert train dataset to Hugging Face datasets
+    train_data_oversampled = Dataset.from_list(oversampled_train)
     
-    final_class_count = Counter([item["label"] for item in train_data_balanced])
-    print(f"\nFinal training dataset after oversampling:")
-    print(f"Total samples: {len(train_data_balanced)}")
-    print(f"Class distribution:")
-    for label, count in final_class_count.items():
-        print(f"{label}: {count}")
-    
-    # Initialize tokenizer
-    print(f"\n" + "="*60)
-    print("INITIALIZING MODEL AND TOKENIZER")
-    print("="*60)
-    
-    print(f"Loading tokenizer...")
+
+    # Tokenization for FLAN-T5
+    model_name = '/llm_model_files/models--google--flan-t5-large/snapshots/0613663d0d48ea86ba8cb3d7a44f0f65dc596a2a/'
     tokenizer = T5Tokenizer.from_pretrained(model_name)
-    
-    # Tokenize datasets
-    print(f"Tokenizing datasets...")
     
     def tokenize_function(examples):
         return tokenize_batch(examples, tokenizer)
     
-    tokenized_train = train_data_balanced.map(
+    tokenized_train = train_data_oversampled.map(
         tokenize_function,
         batched=True,
-        remove_columns=["sentence", "label", "file_name"]
+        remove_columns=["site", "sentence", "label", "file_name"]
     )
     
     tokenized_test = test_data.map(
         tokenize_function,
         batched=True,
-        remove_columns=["sentence", "label", "file_name"]
+        remove_columns=["site", "sentence", "label", "file_name"]
     )
-    
-    # Initialize model with LoRA
-    print(f"Loading FLAN-T5 model with LoRA")
+
+    # Model
     model = T5ForConditionalGeneration.from_pretrained(model_name)
     
-    # Configure LoRA
+    # Use LoRA for efficient fine-tuning
     lora_config = LoraConfig(
-        r=16,
-        lora_alpha=32,
-        lora_dropout=0.05,
+        r=16, # Rank of LoRA adaptation
+        lora_alpha=32, # Scaling factor
+        lora_dropout=0.05, # Dropout for regualization
         target_modules=["q", "v"],
         bias="none",
-        task_type=TaskType.SEQ_2_SEQ_LM
+        modules_to_save=["classifier"],
+        task_type=TaskType.SEQ_2_SEQ_LM # Task type for LoRA
     )
-    
-    # Apply LoRA to model
+
     model = get_peft_model(model, lora_config)
-    
+
     # Move model to GPU if available
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
     
-    # Set up training arguments
+    # Training args
     training_args = TrainingArguments(
-        output_dir="results/flan_t5_lora",
+        output_dir=f"/results/flan_t5_lora_all_data_w_oversampling",
         evaluation_strategy="epoch",
         learning_rate=5e-5,
         per_device_train_batch_size=8,
@@ -375,17 +284,14 @@ def main():
         weight_decay=0.01,
         save_strategy="epoch",
         load_best_model_at_end=True,
-        logging_dir="/logs/flan_t5_lora",
+        logging_dir=f"/logs/flan_t5_lora_all_data_w_oversampling",
         seed=seed_value,
         dataloader_num_workers=4,
         fp16=torch.cuda.is_available(),
-        report_to="none",
-        logging_steps=10,
-        save_total_limit=2,
         push_to_hub=False,
+        save_total_limit=2,
     )
-    
-    # Initialize Trainer
+
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -393,89 +299,72 @@ def main():
         eval_dataset=tokenized_test,
         tokenizer=tokenizer,
     )
-    
-    # Train model
-    print(f"\n" + "="*60)
-    print("TRAINING MODEL")
-    print("="*60)
-    
+
     trainer.train()
     
-    # Evaluate model
-    print(f"\n" + "="*60)
-    print("EVALUATING MODEL")
-    print("="*60)
+    # Evaluate on held-out test site
+    true_labels = holdout_df["label"].tolist()
+    test_sentences = holdout_df["sentence"].tolist()
+    predicted_labels = predict_batch(test_sentences, model, tokenizer)
     
-    eval_results = trainer.evaluate()
-    print("Evaluation results:")
-    for key, value in eval_results.items():
-        if isinstance(value, float):
-            print(f"{key}: {value:.4f}")
-        else:
-            print(f"{key}: {value}")
+    # Calculate metrics
+    y_true = [valid_labels.index(label) for label in true_labels]
+    y_pred = [valid_labels.index(label) if label in valid_labels else 0 
+              for label in predicted_labels]
+    macro_f1 = f1_score(y_true, y_pred, average="macro")
+
+    print("\nClassification Report:\n")
+    print(classification_report(y_true, y_pred, target_names=valid_labels))
+    print(f"Macro F1: {macro_f1:.4f}")
     
-    # Generate predictions for test set
-    print(f"\nGenerating predictions...")
-    true_labels = [item["label"] for item in test_data]
-    test_sentences = [item["sentence"] for item in test_data]
-    predicted_labels = predict_batch(test_sentences, model, tokenizer, batch_size=8)
+    # Error analysis
+    header = ['True_label', 'Predicted_label', 'Span']
     
-    # Print classification report
-    print(f"\n" + "="*60)
-    print("CLASSIFICATION RESULTS")
-    print("="*60)
-    print(classification_report(true_labels, predicted_labels, target_names=valid_labels, zero_division=0))
+    with open('FLAN_T5_LoRA_errors.csv', 'w', encoding="utf-8", newline = '') as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+
+        for t, p, s in zip(true_labels, predicted_labels, test_sentences):
+            if (p == "social isolation" and t != "social isolation") or \
+            (p == "social support" and t != "social support") or \
+            (p == "no social isolation" and t != "no social isolation"):
+                s = s.lower()
+                writer.writerow([t, p, s])
+
     
-    # Calculate F1 score
-    macro_f1 = f1_score(true_labels, predicted_labels, average="macro", labels=valid_labels, zero_division=0)
-    print(f"\nMacro F1 Score: {macro_f1:.4f}")
-    print("="*60)
+    clear_gpu_memory()
     
-    # Save model and tokenizer
-    print(f"\n" + "="*60)
-    print("SAVING MODEL")
-    print("="*60)
-    
-    save_dir = "results/flan_t5_lora"
+    # Manually save the model and tokenizer
+    save_dir = '/finetuned_models/manual_save/flan_t5_lora_all_data_final'
+    os.makedirs(save_dir, exist_ok=True)
     model.save_pretrained(save_dir)
     tokenizer.save_pretrained(save_dir)
-    
-    print(f"Model saved to: {save_dir}")
-    
-    # Save predictions for analysis
-    predictions_df = pd.DataFrame({
-        "text": test_sentences,
-        "true_label": true_labels,
-        "predicted_label": predicted_labels
-    })
-    
-    predictions_df.to_csv("/results/flant5_lora_predictions.csv", index=False)
-    print(f"Predictions saved to: flant5_lora_predictions.csv")
-    
-    # Save training summary
-    results_summary = {
-        "model": "FLAN-T5-large with LoRA",
-        "training_samples": len(train_data_balanced),
-        "test_samples": len(test_data),
-        "class_distribution_training": dict(final_class_count),
-        "class_distribution_test": dict(Counter(true_labels)),
-        "macro_f1": float(macro_f1),
-        "seed": seed_value,
-        "valid_labels": valid_labels,
-        "lora_config": {
-            "r": 16,
-            "lora_alpha": 32,
-            "lora_dropout": 0.05,
-            "target_modules": ["q", "v"]
-        }
-    }
-    
-    with open("/results/flant5_lora_training_summary.json", "w") as f:
-        json.dump(results_summary, f, indent=2)
-    
-    print(f"Training summary saved to: flant5_lora_training_summary.json")
-    print(f"\n" + "="*60)
 
+    return macro_f1
+
+
+# Execution
+def main():
+    # Define valid labels
+    valid_labels = ['social isolation', 'no social isolation', 'social support']
+
+    # Set random seed
+    seed_value = 43
+    set_seed(seed_value)
+
+    sites = {
+        "site1_data": "/Data/site1_social_isolation_complete_annotated_data_fulltext.json",
+        "site2_data": "/Data/site2_social_isolation_complete_annotated_data_fulltext.json",
+        "site3_data": "/Data/site3_social_isolation_complete_annotated_data_fulltext.json",
+    }
+
+    site_data = {}
+    for site, path in sites.items():
+        labelled, _ = prepare_data(path, valid_labels)
+        site_data[site] = labelled
+        print(f"{site}: {len(labelled)} samples")
+
+    results = train_eval(site_data, valid_labels, seed_value)
 
 if __name__ == "__main__":
     main()
