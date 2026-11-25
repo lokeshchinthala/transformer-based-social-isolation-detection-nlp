@@ -1,12 +1,11 @@
 #!/usr/bin/env python
 """
-FLAN-T5 IECV for Social Isolation Detection - Cross-Site Validation
+FLAN-T5 IECV for Social Isolation Detection using the combined multisite dataset with oversampling of minority classes
 
-This script performs Internal-External cross-validation (IECV) for social isolation detection
-using FLAN-T5-large across multiple healthcare sites.
+This script performs full fine-tuning of FLAN-T5 IECV for social isolation detection across multiple healthcare sites.
 
 Author: Lokesh Chinthala
-Date: 09/05/2025
+Date: 03/10/2026
 License: MIT License
 """
 
