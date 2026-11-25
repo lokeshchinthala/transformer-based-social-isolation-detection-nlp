@@ -59,9 +59,7 @@ def clear_gpu_memory():
         torch.cuda.ipc_collect()
 
 
-# #Helper functions
-
-
+# Helper functions
 def clean_text(text):
     """Clean narrative text: remove symbols, bullets, URLs, punctuation, etc."""
     if not isinstance(text, str):
